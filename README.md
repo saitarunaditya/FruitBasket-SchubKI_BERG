@@ -89,16 +89,46 @@ locally under `eeg-mind-reading-challenge/`:
 - `features_berg/`, `features_vit/` - cached BERG/ViT features (regenerated)
 - `brain-encoding-response-generator/` - BERG model weights (downloaded from AWS)
 
+## Model weights (reproducibility)
+
+- **Public pretrained model (not uploaded, by rule):** BERG
+  `eeg-things_eeg_2-vit_b_32` (dataset THINGS-EEG2, backbone torchvision
+  `ViT_B_32_Weights.IMAGENET1K_V1`). Source: https://github.com/gifale95/BERG .
+  Weights are fetched from the BERG public AWS Open Data bucket (see below). The
+  ViT-B/32 ImageNet backbone is downloaded automatically by torchvision on first
+  use.
+- **Our trained encoder:** there is **no custom weight file to upload**. The
+  submission pipeline (`05_make_submission.ipynb`) **retrains the per-subject
+  encoder from scratch** (StandardScaler -> PCA(0.95) -> StandardScaler ->
+  RidgeCV) on each run. These estimators are **deterministic** (PCA uses
+  `svd_solver='full'`, RidgeCV is closed-form), so re-running reproduces the same
+  predictions bit-for-bit without any random seed.
+
 ## How to reproduce the submission
 
-1. Place the data folders above under `eeg-mind-reading-challenge/`.
-2. Download the BERG subject-01 EEG weights:
+1. Place the data folders above under `eeg-mind-reading-challenge/` (the organizers
+   already have `stimuli_*`, `trn/`, `tst/`, `tst_stim/`).
+2. Install dependencies (see Environment) in a Python 3.11+ environment.
+3. Download the BERG ViT-B/32 EEG weights for **all subjects used by the pipeline**.
+   The submission ranks sub-05 and sub-06 and self-checks on sub-01, so download at
+   least subjects 01, 05 and 06 (downloading 01-06 is safest). Run from the repo root:
    ```
    python -m awscli s3 sync --no-sign-request \
      s3://brain-encoding-response-generator/encoding_models/modality-eeg/train_dataset-things_eeg_2/model-vit_b_32 \
      ./eeg-mind-reading-challenge/brain-encoding-response-generator/encoding_models/modality-eeg/train_dataset-things_eeg_2/model-vit_b_32 \
-     --exclude "*" --include "*subject-01.npy"
+     --exclude "*" \
+     --include "*subject-01.npy" --include "*subject-05.npy" --include "*subject-06.npy"
    ```
-3. Run `05_make_submission.ipynb` top to bottom. It self-checks the format/score on
-   sub-01, then writes `sub-05_ranked_candidate_list.npy` and
-   `sub-06_ranked_candidate_list.npy`.
+   (For the full set, replace the three `--include` lines with `--include "*.npy"`.)
+   Each subject file is ~1.8 GB of weights plus a small metadata file.
+4. Run `05_make_submission.ipynb` top to bottom. It:
+   - builds BERG features for the test videos and each subject's training videos
+     (cached under `features_berg/`),
+   - trains the per-subject encoder,
+   - runs a sub-01 format + score self-check (expected ~top-1 0.049 / top-5 0.216),
+   - writes `sub-05_ranked_candidate_list.npy` and `sub-06_ranked_candidate_list.npy`
+     in the required 102x102, original (unsorted) order.
+
+Note on Python version: developed and run on Python 3.13.7. The notebooks use only
+numpy / scipy / scikit-learn / opencv / torch(+BERG); notebook 07 is pure
+numpy/scipy/sklearn and 3.11-compatible. No functionality relies on 3.12+ features.
