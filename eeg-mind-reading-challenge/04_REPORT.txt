@@ -1,0 +1,215 @@
+================================================================================
+REPORT - 04_berg_features_ridge.ipynb
+Option B: BERG features + a trained Ridge encoder
+================================================================================
+
+--------------------------------------------------------------------------------
+1. ONE-LINE SUMMARY
+--------------------------------------------------------------------------------
+This notebook identifies which movie a person watched from their EEG, by using
+the BERG toolbox as a *feature extractor* for the videos and then TRAINING a
+subject-specific linear model (Ridge regression) that maps those features to the
+person's real brain responses. It is the "Option B" counterpart to notebook 03
+("Option A").
+
+
+--------------------------------------------------------------------------------
+2. WHERE THIS FITS IN THE PROJECT
+--------------------------------------------------------------------------------
+The project matches EEG recordings to the videos that produced them. Three
+approaches now exist in this folder:
+
+  Notebook 01/02  AlexNet features  -> PCA -> RidgeCV -> EEG     (trained)
+  Notebook 03     BERG in silico EEG used DIRECTLY               (Option A, no training)
+  Notebook 04     BERG features     -> PCA -> RidgeCV -> EEG     (Option B, trained)  <- THIS FILE
+
+BERG = Brain Encoding Response Generator. It ships pretrained "encoding models"
+that turn a stimulus into a simulated ("in silico") brain response. The specific
+model used here is `eeg-things_eeg_2-vit_b_32`: an EEG encoding model trained on
+the THINGS-EEG2 dataset (people viewing still IMAGES) with a ViT-B/32 backbone.
+
+
+--------------------------------------------------------------------------------
+3. WHY OPTION B EXISTS (THE PROBLEM WITH OPTION A)
+--------------------------------------------------------------------------------
+Option A (notebook 03) took BERG's simulated EEG and matched it DIRECTLY against
+the real measured EEG. Result on subject 1:
+      top-1 = 0.0196   top-5 = 0.0784   (chance = 0.0098 / 0.0490)
+That is only ~2x chance. Two reasons it is weak:
+  - BERG's model was trained on STILL IMAGES, not MOVIES.
+  - BERG outputs a 63-channel x 140-timepoint response, which does NOT match this
+    dataset's 17-channel x 300-timepoint movie EEG. A direct comparison is an
+    apples-to-oranges match.
+
+Option B fixes this by NOT trusting BERG's response as the final answer. Instead
+it uses BERG's response only as a rich "description" of each video (a feature
+vector), and trains Ridge regression to learn how THIS subject's brain responses
+relate to that description. The learned mapping absorbs the layout mismatch and
+the image-vs-movie gap, exactly the trick that made the AlexNet notebook work.
+
+
+--------------------------------------------------------------------------------
+4. DATA USED
+--------------------------------------------------------------------------------
+- Real training EEG: trn/sub-01_trn.npz    -> 968 videos, (968, 17, 1500)
+- Real test EEG:     tst/sub-01_tst.npy    -> 102 videos, (102, 17, 1500)
+- Training videos:   stimuli_train/0001.mp4 ... 1000.mp4
+- Test videos:       stimuli_test/1001.mp4 ... 1102.mp4
+- Ground truth:      tst_stim/sub-01_tst_stim.npy (true video id per test row)
+- Frames:            frames/ (7744 train) and frames_test/ (816 test), 8 per video
+- BERG weights:      brain-encoding-response-generator/.../model-vit_b_32/
+                     weights_subject-01.npy (subject-1 only, ~1.8 GB)
+
+Sampling rate 500 Hz; everything is decimated by 5 -> 100 Hz, so 1500 time
+samples become 300 (3 seconds of EEG).
+
+
+--------------------------------------------------------------------------------
+5. CELL-BY-CELL WALKTHROUGH
+--------------------------------------------------------------------------------
+Cell 1 (markdown): overview and requirements.
+
+Cell 2 (code): Windows UTF-8 fix + clean BERG import.
+  - BERG reads its YAML model cards with open() and no encoding, which crashes on
+    Windows (cp1252) with UnicodeDecodeError on byte 0x9d. This cell patches
+    open() to default to UTF-8 and drops any half-imported berg modules so the
+    later import succeeds. Also sets DEVICE = 'cuda' if a GPU build of torch is
+    present, else 'cpu'.
+
+Cell 3 (code): Config.
+  - SUB=1, paths, MODEL_ID, decimation params (DEC=5), N_FRAMES=8, IMG_SIZE=224,
+    and tst_ids = 1001..1102. Creates a cache folder features_berg/.
+
+Cell 4-5 (code): Load real EEG.
+  - Loads training EEG (968, 17, 1500) and decimates to (968, 17, 300).
+  - Loads test EEG and decimates to (102, 17, 300). Records n_chan=17, n_time=300.
+
+Cell 6-7 (code): Frame helpers + ensure frames exist.
+  - video_for() matches videos by basename (Windows/Unix safe).
+  - dump_frames() extracts 8 evenly spaced frames per video, skipping any already
+    written. Runs for both train and test sets (no-op if frames already exist).
+  - frames_for() / load_rgb() fetch and RGB-convert frames.
+
+Cell 8-9 (code): Load BERG + feature extractor.
+  - Loads the pretrained model `eeg-things_eeg_2-vit_b_32`, subject 1.
+  - to_berg_stimulus(): resizes each RGB frame to a 224x224 SQUARE and transposes
+    HWC -> CHW, producing (N, 3, 224, 224) uint8. This exact format is REQUIRED by
+    BERG (4-D, channels-first, square, integer [0,255]); getting it wrong was the
+    earlier RuntimeError "tensor a (268) must match tensor b (3)".
+  - berg_response(): runs berg.encode() -> (N, 4 reps, 63, 140) and averages over
+    the 4-repetition axis -> (N, 63, 140).
+
+Cell 10-11 (code): Build BERG feature matrices (the slow step).
+  - For every video, encode its 8 frames, flatten each (63x140) response, and
+    average across frames -> one 8820-dim feature vector per video.
+  - X_trn ends up (968, 8820); X_tst ends up (102, 8820).
+  - Results are cached to features_berg/berg_trn_sub-01.npz and berg_tst_sub-01.npz
+    so this extraction (7744 train encodes) only runs once. Re-runs load the cache.
+
+Cell 12-13 (code): Train the encoder (same recipe as notebook 01).
+  - StandardScaler (sc) on X_trn.
+  - PCA(0.95) -> keeps enough components to retain 95% variance (dimensionality
+    printed at run time).
+  - A second StandardScaler (sc2) on the PCA output.
+  - RidgeCV(alphas=logspace(-3,6,20)) fits BERG-features -> real EEG
+    (trn_eeg flattened to 968 x 5100). Chosen alpha is printed.
+
+Cell 14-15 (code): Predict + build similarity.
+  - Test features go through the SAME sc / pca / sc2 (transform only, never refit).
+  - model.predict() -> predicted test EEG reshaped to (102, 17, 300).
+  - Load ground truth gt; order sorts measured rows.
+  - Take time window [5:60], flatten, z-score both measured (M) and predicted (P),
+    and compute the (102 x 102) correlation similarity matrix S.
+
+Cell 16-17 (code): Rank + score.
+  - order_idx = argsort(-S) per row; ranked = (102,102) video ids best-first.
+  - top-1 = correct video is rank 1; top-5 = correct video within top 5.
+  - Prints the result next to the baselines (Option A and AlexNet) for comparison.
+
+Cell 18 (code): Save ranked list -> sub-01_ranked_candidate_list_berg_ridge.npy.
+
+Cell 19 (markdown): notes and next-step ideas.
+
+
+--------------------------------------------------------------------------------
+6. INPUTS -> OUTPUTS AT A GLANCE
+--------------------------------------------------------------------------------
+INPUTS:
+  - Real EEG (train 968x17x1500, test 102x17x1500)
+  - Videos (train + test) and their extracted frames
+  - Pretrained BERG EEG model weights (subject 1)
+
+INTERMEDIATES:
+  - BERG features: X_trn (968, 8820), X_tst (102, 8820)  [cached]
+  - Fitted sc, pca, sc2, RidgeCV model
+  - Predicted test EEG (102, 17, 300)
+  - Similarity matrix S (102, 102)
+
+OUTPUTS:
+  - ranked (102, 102): for each test recording, all candidate videos best-first
+  - top-1 / top-5 / median-rank scores printed
+  - sub-01_ranked_candidate_list_berg_ridge.npy on disk
+
+
+--------------------------------------------------------------------------------
+7. HOW TO RUN
+--------------------------------------------------------------------------------
+1. Use the Python 3.11+ environment (here: .venv, Python 3.13.7) as the kernel.
+2. Make sure berg is installed and the subject-01 vit_b_32 weights are under
+   BERG_DIR (already done for notebook 03).
+3. Restart the kernel and run top to bottom.
+4. First run is slow: it encodes 968 training videos x 8 frames through BERG.
+   It is cached, so later runs are fast. GPU (DEVICE='cuda') is much faster than
+   CPU; the RTX 5070 in this machine works once torch is the CUDA (cu128) build.
+
+
+--------------------------------------------------------------------------------
+8. EXPECTED RESULT / INTERPRETATION
+--------------------------------------------------------------------------------
+Baselines for subject 1:
+  chance:                 top-1 0.0098   top-5 0.0490
+  Option A (BERG direct): top-1 0.0196   top-5 0.0784
+  AlexNet (notebook 02):  top-1 0.0392   top-5 0.1176
+
+MEASURED RESULT (subject 1):
+  Option B (BERG + Ridge): top-1 0.0490   top-5 0.2157   median rank 20.0
+
+VERDICT: Option B is the WINNER. It beats every other approach on every metric:
+  - top-1 0.0490 = 5x chance, and ~25% higher than AlexNet (0.0392).
+  - top-5 0.2157 = 4.4x chance, and nearly 2x AlexNet (0.1176) - the biggest gain.
+  - median rank 20.0, better than AlexNet (25.5) and far better than chance (~51.5).
+
+Full ranking (best to worst):
+  1. Option B (BERG + Ridge)  top-1 0.0490  top-5 0.2157  median 20.0
+  2. AlexNet (notebook 02)     top-1 0.0392  top-5 0.1176  median 25.5
+  3. Option A (BERG direct)    top-1 0.0196  top-5 0.0784
+  4. Chance                    top-1 0.0098  top-5 0.0490  median ~51.5
+
+Interpretation: BERG's raw simulated EEG was weak on its own (Option A), but as a
+stimulus descriptor fed into a subject-trained Ridge encoder it carries MORE
+movie-relevant signal than AlexNet features for this task. The learned mapping
+absorbed both the image-vs-movie gap and the 63x140-vs-17x300 layout mismatch.
+
+
+--------------------------------------------------------------------------------
+9. LIMITATIONS & NEXT STEPS
+--------------------------------------------------------------------------------
+- BERG's model was trained on still images, not movies; its features may miss
+  motion/temporal cues that matter for video.
+- Only 8 frames per video are used, averaged - temporal structure is largely
+  discarded on the feature side.
+- Ideas to improve:
+    * Use an intermediate BERG/ViT feature instead of the final in silico EEG.
+    * Concatenate BERG features with AlexNet features and train one Ridge model.
+    * Keep per-frame (temporal) features instead of averaging.
+- Subjects: training EEG exists for 01-06, but ground-truth scoring files exist
+  only for 01-04. Subjects 05/06 can produce a ranked list but cannot be scored.
+
+
+--------------------------------------------------------------------------------
+10. KEY FILES PRODUCED BY THIS NOTEBOOK
+--------------------------------------------------------------------------------
+  features_berg/berg_trn_sub-01.npz             cached train features (968, 8820)
+  features_berg/berg_tst_sub-01.npz             cached test features  (102, 8820)
+  sub-01_ranked_candidate_list_berg_ridge.npy   final ranked candidate list (102,102)
+================================================================================

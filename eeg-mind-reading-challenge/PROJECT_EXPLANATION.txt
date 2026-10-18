@@ -1,0 +1,252 @@
+================================================================================
+EEG MIND-READING CHALLENGE - PROJECT EXPLANATION
+================================================================================
+
+WHAT IS THIS PROJECT?
+--------------------------------------------------------------------------------
+This is a "brain decoding" / "mind reading" project. People watched short video
+clips while their brain activity was recorded with EEG (electroencephalography -
+electrodes on the scalp that measure electrical signals from the brain).
+
+The goal: given a person's EEG brain response to an UNKNOWN video, figure out
+WHICH video they were watching, by comparing it against a set of candidate
+videos.
+
+It does NOT literally read thoughts. It learns the statistical relationship
+between "what the eyes saw" and "what the brain signal looked like", then uses
+that relationship to match brain signals back to videos.
+
+The trick that makes this work: instead of trying to go directly from brain ->
+video (hard), it builds a model that goes video -> predicted brain signal (an
+"encoding model"). Then, to identify an unknown clip, it predicts the brain
+response for every candidate video and picks the one whose predicted response
+best matches the real measured brain response.
+
+
+THE BIG PICTURE (TWO NOTEBOOKS)
+--------------------------------------------------------------------------------
+1) 01_preprocess_and_train_model.ipynb
+   TRAINS the encoding model on data where we KNOW which video goes with which
+   EEG recording. Saves the trained model to "encoder_sub-01.joblib".
+
+2) 02_predict_movies.ipynb
+   LOADS that saved model and USES it on test data to rank candidate videos for
+   each unknown EEG recording.
+
+"sub-01", "sub-02" etc. = subject 1, subject 2 (different people). Each person
+gets their own model because everyone's brain signals differ.
+
+
+--------------------------------------------------------------------------------
+KEY INGREDIENTS / DATA
+--------------------------------------------------------------------------------
+- EEG data:
+    trn/sub-XX_trn.npz  -> training EEG (968 clips), shape (968, 17, 1500)
+                           = 968 videos, 17 electrodes, 1500 time samples
+    tst/sub-XX_tst.npy  -> test EEG (102 clips),  shape (102, 17, 1500)
+  Sampling rate SFREQ = 500 Hz, so 1500 samples = 3 seconds of brain activity.
+
+- Videos (the stimuli people watched):
+    stimuli_train/0001.mp4 ... 1000.mp4   (training videos)
+    stimuli_test/1001.mp4  ... 1102.mp4   (test videos, 102 of them)
+
+- Ground truth (test only):
+    tst_stim/sub-XX_tst_stim.npy -> the TRUE video id for each test EEG row,
+    used to score how well the matching worked.
+
+- Generated/intermediate folders:
+    frames/        -> still images pulled out of the training videos
+    frames_test/   -> still images pulled out of the test videos
+    features/      -> AlexNet features for training frames
+    features_test/ -> AlexNet features for test frames (currently EMPTY - see below)
+
+
+================================================================================
+NOTEBOOK 1: 01_preprocess_and_train_model.ipynb  (TRAINING)
+================================================================================
+Step by step, what each stage does:
+
+1. IMPORTS & CONFIG
+   Loads libraries (net2brain, OpenCV, numpy, scipy). Sets SUB = 1, folder
+   paths, SFREQ = 500 Hz, and frame grid size n_chan=17, n_time=300.
+
+2. LOAD TRAINING EEG
+   Reads trn/sub-01_trn.npz -> trn_eeg shape (968, 17, 1500).
+   968 training videos, 17 electrode channels, 1500 time points each.
+
+3. DOWNSAMPLE (DECIMATE) THE EEG
+   DEC = 5. decimate() drops the sampling rate from 500 Hz to 100 Hz, so
+   1500 time points -> 300 time points. Shape becomes (968, 17, 300).
+   It uses a proper anti-alias filter (not plain slicing) so high-frequency
+   noise doesn't "fold" into the signal. This makes the data smaller and the
+   regression faster.
+
+4. TURN VIDEOS INTO PICTURES (FRAME EXTRACTION)
+   N_FRAMES = 8. For every training video, dump_frames() grabs 8 evenly spaced
+   still frames and saves them as .jpg in frames/ (e.g. 00001_f00.jpg ...
+   00001_f07.jpg). Result: 968 videos x 8 = 7744 frames.
+
+5. TURN PICTURES INTO NUMBERS (DEEP FEATURES)
+   Uses net2brain's FeatureExtractor with AlexNet (a pretrained image neural
+   network). Each frame is pushed through AlexNet and the activations of one
+   internal layer are saved.
+       LAYER = 'features.3'
+   This converts each image into a long vector of numbers that describes "what
+   the image looks like" to the network (edges, textures, shapes, etc.).
+   fx.extract() writes features/consolidated_features.3.npz.
+
+6. BUILD ONE FEATURE VECTOR PER VIDEO
+   features_for() loads the saved features, and for each video averages the
+   feature vectors of its 8 frames into a single vector.
+   Result X_trn shape (968, 139968) = 968 videos, each a 139,968-number vector.
+
+7. SIMPLIFY THE FEATURES (SCALING + PCA)
+   139,968 numbers per video is huge. So:
+     - StandardScaler (sc): standardizes each feature (mean 0, std 1).
+     - PCA (pca): keeps enough components to retain 95% of the variance,
+       shrinking 139,968 -> 723 dimensions. (X_trn_p shape (968, 723))
+     - A second StandardScaler (sc2): standardizes those 723 PCA values.
+   This keeps the useful information while making the model fast and stable.
+
+8. TRAIN THE ENCODING MODEL (VIDEO -> BRAIN)
+   RidgeCV (ridge regression with automatic strength selection) learns to map
+   the 723 image-feature numbers -> the flattened EEG (17 x 300 = 5100 numbers).
+       model.fit(X_trn_s, trn_eeg.reshape(968, -1))
+   In plain words: "given what the video looks like, predict the brain signal."
+   The chosen regularization strength printed as alpha ~= 12742.
+
+9. SANITY CHECK & SAVE
+   It predicts EEG back on the training videos to see the model is learning
+   something sensible (plots an ERP curve). Finally it bundles everything the
+   second notebook needs into encoder_sub-01.joblib:
+       sc, pca, sc2, model   (the preprocessing + the trained regression)
+       LAYER, n_chan, n_time (config)
+       DEC, SFREQ, N_FRAMES  (config)
+
+
+================================================================================
+NOTEBOOK 2: 02_predict_movies.ipynb  (PREDICTION / MATCHING)
+================================================================================
+This reuses the exact same preprocessing recipe and model from the saved file,
+so the test data is treated identically to the training data.
+
+1. LOAD THE SAVED ENCODER
+   joblib.load('encoder_sub-01.joblib') restores sc, pca, sc2, model and the
+   config values.
+
+2. LOAD TEST EEG + DECIMATE
+   tst/sub-01_tst.npy, shape (102, 17, 1500). Decimated the same way to
+   (102, 17, 300). 102 unknown test clips.
+
+3. EXTRACT FRAMES + FEATURES FOR TEST VIDEOS
+   Same as training, but on stimuli_test/ (videos 1001..1102):
+     - dump_frames() writes test frames to frames_test/
+     - fx.extract() writes features_test/consolidated_features.3.npz
+     - features_for() averages to X_tst shape (102, 139968)
+   IMPORTANT: features_test/ is currently EMPTY. These steps must actually run
+   (and succeed) before the "features_for" cell can load anything.
+
+4. MAP TEST FEATURES INTO THE MODEL'S SPACE
+   Apply the SAME transforms learned during training (note: .transform, not
+   .fit - we must not re-learn on test data):
+       X_tst_z = sc.transform(X_tst)
+       X_tst_p = pca.transform(X_tst_z)   -> (102, 723)
+       X_tst_s = sc2.transform(X_tst_p)
+
+5. PREDICT BRAIN RESPONSE FOR EACH TEST VIDEO
+   pred_tst_eeg = model.predict(X_tst_s)
+   Reshaped to (102, 17, 300): the model's GUESS of what the brain response
+   should look like for each test video.
+
+6. MATCH PREDICTED vs MEASURED EEG
+   - gt = true video id per test EEG row; order sorts rows so predictions and
+     measurements line up.
+   - Take a time window [5:60] of each signal, flatten, z-score it.
+   - Compute a correlation-like similarity matrix S (102 x 102) between every
+     measured brain response and every predicted brain response.
+   - For each measured response, the video whose PREDICTED response correlates
+     best is the top guess.
+
+7. SCORE THE RESULTS
+       top-1 ~ 0.039  (3.9%)   vs chance 1/102  = 0.98%
+       top-5 ~ 0.118  (11.8%)  vs chance 5/102  = 4.9%
+       median rank ~ 25.5      vs chance ~51.5
+   top-1 = how often the correct video is the #1 guess.
+   top-5 = how often the correct video is in the top 5 guesses.
+   These are modest but clearly BETTER THAN CHANCE (about 4x), which shows the
+   pipeline genuinely extracts real brain-to-video signal. It's a simple
+   baseline; bigger models / more data would improve it.
+
+8. PRODUCE THE RANKED CANDIDATE LIST
+   For each test EEG row, rank ALL 102 videos best-to-worst:
+       ranked  -> shape (102, 102) of video ids, best guess first in each row.
+   This is the main deliverable: for every brain recording, an ordered list of
+   which video it most likely corresponds to. It's saved to
+   sub-XX_ranked_candidate_list.npy.
+
+
+================================================================================
+WHY THE "ENCODING" APPROACH (VIDEO -> BRAIN)?
+================================================================================
+Going straight from a messy 17x300 brain signal to "which of 102 videos" is
+hard and needs lots of data. Instead this project learns the easier direction
+(video -> expected brain signal) using a pretrained image network to describe
+the videos. Then identification becomes a simple matching problem: predict the
+brain signal for each candidate and pick the best match. This is a standard and
+effective strategy in computational neuroscience.
+
+
+================================================================================
+BUGS FOUND & FIXED IN 02_predict_movies.ipynb (during this session)
+================================================================================
+1. video_for() - IndexError: list index out of range
+   Cause: it matched video paths using a hardcoded forward slash
+   ("/{id}.mp4"), but on Windows glob paths use a backslash, so nothing matched
+   and positions[0] failed on an empty list.
+   Fix: match on the file's basename instead, and int()-normalize the id:
+       target = f'{int(stim_id)}.mp4'
+       positions = [v for v in vids if os.path.basename(v) == target]
+       assert positions, f'no video found for stimulus {stim_id}'
+
+2. features_for() - TypeError: bad operand type for unary +: 'str'
+   Cause: a stray leading "+" -> np.load(+FEAT_TEST_DIR + ...), which applies
+   unary plus to a string (not allowed).
+   Fix: remove the stray "+":
+       z = np.load(FEAT_TEST_DIR + '/consolidated_' + layer_path + '.npz')
+
+3. np.save cell - NameError: subject_num / eeg_arr not defined
+   Cause: used variables that never existed.
+   Fix: use the real variables and zero-pad the subject number:
+       np.save(f'sub-{SUB:02d}_ranked_candidate_list.npy', ranked)
+
+
+================================================================================
+THINGS TO WATCH (NOT code typos - environment/data)
+================================================================================
+- features_test/ is EMPTY. You must successfully run the frame-dump and
+  fx.extract() cells before the features_for() cell can load the .npz.
+
+- The FeatureExtractor is created with device='cuda'. If this machine has no
+  NVIDIA GPU, that will fail. Change it to device='cpu' (or auto-detect).
+
+- tst_stim/ only contains subjects 01-04. The final markdown asks for the
+  ranked lists of subjects 5 and 6, but there is no ground-truth file for them,
+  so any scoring that loads sub-05/06_tst_stim.npy will fail. (You can still
+  produce the ranked list for 5 and 6 - you just can't score it without truth.)
+
+
+================================================================================
+GLOSSARY (QUICK)
+================================================================================
+EEG            Brain electrical activity recorded from scalp electrodes.
+Channel        One electrode (there are 17).
+Decimate       Downsample a signal (with an anti-alias filter).
+AlexNet        A pretrained image recognition neural network.
+Feature vector A list of numbers describing an image/video.
+PCA            Shrinks many numbers down to a smaller set that keeps the info.
+StandardScaler Rescales data to mean 0, std 1.
+Ridge regression  Linear model with regularization to avoid overfitting.
+Encoding model Maps stimulus (video) -> predicted brain response.
+top-1 / top-5  How often the correct answer is the 1st / within the first 5.
+Ranked list    Videos ordered from most to least likely for a brain recording.
+================================================================================
